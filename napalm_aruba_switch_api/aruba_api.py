@@ -2,6 +2,79 @@ from napalm.base.base import NetworkDriver
 import requests
 import os
 import base64
+import re
+
+SECONDS_IN_DAY = 86400
+SECONDS_IN_HOUR = 3600
+SECONDS_IN_MINUTE = 60
+
+
+def parse_snmp(text):
+    value = text.split(' = ', 1)[1]
+    return value
+
+
+def parse_uptime(text):
+    d, h, m, s = text.strip().split(':')
+    days_s = int(d, 10) * SECONDS_IN_DAY
+    hours_s = int(h, 10) * SECONDS_IN_HOUR
+    minutes_s = int(m, 10) * SECONDS_IN_MINUTE
+    seconds = float(s)
+
+    return days_s + hours_s + minutes_s + seconds
+
+
+def parse_snmp_list(text):
+    lines = []
+    for line in text.strip().split('\n'):
+        lines.append(parse_snmp(line))
+
+    return lines
+
+
+def parse_int_brief(text):
+    lines = text.strip().split('\n')
+    lines = list(lines)
+
+    ports = []
+
+    if 'third-party transceiver' in lines[-1]:
+        del lines[-1]
+
+    # delete all the header foo
+    while '------' not in lines[0]:
+        del lines[0]
+    del lines[0]
+
+    for line in lines:
+        port = line.split(None, 1)[0].strip()
+        ports.append(port)
+
+    return ports
+
+
+def parse_sysdescr(sysdescr):
+    s = sysdescr
+
+    m = re.search(r"Aruba (\S+) (\S+) Switch", s)  # new Aruba-branded switches
+    if m:
+        model = "%s (%s)" % (m.group(2), m.group(1))
+        vendor = "Aruba"
+        return (vendor, model)
+
+    m = re.search(r"ProCurve (\S+) Switch (\S+)", s)
+    if m:
+        model = "%s (%s)" % (m.group(2).strip(","), m.group(1))
+        vendor = "Hewlett Packard (ProCurve)"
+        return (vendor, model)
+
+    m = re.search(r"(\S+) ProCurve Switch (\S+)", s)  # older switches
+    if m:
+        model = "%s (%s)" % (m.group(2).strip(","), m.group(1))
+        vendor = "Hewlett Packard (ProCurve)"
+        return (vendor, model)
+
+    raise Exception("Failed to parse model from sysDescr")
 
 
 class ArubaSwitchApiClient(object):
@@ -14,6 +87,10 @@ class ArubaSwitchApiClient(object):
         self.port = port
         self.username = username
         self.password = password
+
+    def __del__(self):
+        self.logout()
+        return super()
 
     def _get_url(self, relative_path):
         url = os.path.join(self.baseurl, relative_path)
@@ -28,8 +105,10 @@ class ArubaSwitchApiClient(object):
             args['json'] = data
         r = method(**args)
         if raise_on_error and not r.ok:
-            print(r.request.__dict__)
-            print(r.text)
+            raise requests.HTTPError('{} {}: URL: {} data: {}'.format(r.status,
+                                                                      r.reason,
+                                                                      r.url,
+                                                                      r.text))
             r.raise_for_status()
         return r
 
@@ -100,7 +179,8 @@ class ArubaSwitchApiClient(object):
                                                             r['error_msg']))
         output = r['result_base64_encoded']
         output = base64.b64decode(output)
-        return output.decode(encoding='utf-8')
+        output = output.decode(encoding='utf-8').strip('\0')
+        return output
 
     def cli_bulk(self, commands):
         """Note: only config commands?"""
@@ -187,8 +267,6 @@ class ArubaSwitchApiDriver(NetworkDriver):
         # strip off the non-config parts returned by show run/show config
         # as well as the trailing null
         begin = config.find(';')
-        if config[-1] == '\0':
-            return config[begin:-1]
         return config[begin:]
 
     def get_config(self, retrieve=u'all'):
@@ -221,16 +299,41 @@ class ArubaSwitchApiDriver(NetworkDriver):
         return self._api.check_session()
 
     def get_facts(self):
-        super().get_facts()
+        # So... we have this API, but it doesn't actually help with collecting
+        # data... so let's just run CLI commands via the API... including our
+        # CLI command to return SNMP data (I mean... I guess it's easy to
+        # parse...)
+
         # uptime
+        uptime = parse_uptime(self._api.cli('show uptime'))
         # vendor
-        # os_version
-        # serial_number
         # model
-        # hostname
+        sysDescr = self._api.cli('walkMIB sysDescr')
+        (vendor, model) = parse_sysdescr(sysDescr)
+        # os_version
+        os_version = parse_snmp(self._api.cli('walkMIB hpHttpMgVersion'))
+        # serial_number
+        serial = parse_snmp(self._api.cli('walkMIB hpHttpMgSerialNumber'))
+        # hostname # FIXME: don't know where to find this without munging config
         # fqdn
+        hostname = fqdn = parse_snmp(self._api.cli('walkMIB sysName'))
         # interface_list
-        return
+        # ** found a bug -- API displays header/footer but no int on sh int bri
+        # interfaces = parse_int_brief(self._api.cli('show interfaces brief all'))
+        interfaces = parse_snmp_list(self._api.cli('walkMIB ifName'))
+
+        facts = {
+            'uptime': uptime,
+            'vendor': vendor,
+            'model': model,
+            'os_version': os_version,
+            'serial_number': serial,
+            'hostname': hostname,
+            'fqdn': fqdn,
+            'interface_list': interfaces,
+        }
+
+        return facts
 
     def cmd(self, commands):
         result = {}
