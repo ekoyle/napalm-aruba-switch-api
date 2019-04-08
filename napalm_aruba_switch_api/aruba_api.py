@@ -105,10 +105,11 @@ class ArubaSwitchApiClient(object):
             args['json'] = data
         r = method(**args)
         if raise_on_error and not r.ok:
-            raise requests.HTTPError('{} {}: URL: {} data: {}'.format(r.status,
-                                                                      r.reason,
-                                                                      r.url,
-                                                                      r.text))
+            raise requests.HTTPError(
+                '{} {}: URL: {} data: {}'.format(r.status_code,
+                                                 r.reason,
+                                                 r.url,
+                                                 r.text))
             r.raise_for_status()
         return r
 
@@ -195,7 +196,7 @@ class ArubaSwitchApiClient(object):
     def config_payload(self, config, payload_type):
         assert payload_type in ('RPT_PATCH_FILE', 'RPT_BACKUP_FILE', )
 
-        config_base64 = base64.b64encode(config)
+        config_base64 = base64.b64encode(config.encode('utf-8'))
         path = "system/config/payload"
 
         r = self._do_request(requests.post,
@@ -205,17 +206,44 @@ class ArubaSwitchApiClient(object):
 
         r = self._do_check_status(path, r)
 
-        status = r.json()['status']
+        r = r.json()
+
+        status = r['status']
         if status != 'CRS_SUCCESS':
             raise Exception("config payload failed: {}".format(status))
+
         return r
 
-    def config_restore(self, forced_reboot=False, recoverymode=True):
-        file_name = "REST_Payload_Backup"
+    def config_restore(self,
+                       file_name="REST_Payload_Backup",
+                       server_type="ST_FLASH",
+                       tftp_server_address=None,
+                       sftp_server_address=None,
+                       forced_reboot=False,
+                       recoverymode=True):
         path = "system/config/cfg_restore"
+        assert server_type in ("ST_FLASH", "ST_TFTP", "ST_SFTP")
+
+        data = {"server_type": server_type,
+                "file_name": file_name,
+                "is_forced_reboot_enabled": forced_reboot,
+                "is_recoverymode_enabled": recoverymode}
+
+        if server_type == "ST_TFTP":
+            assert tftp_server_address is not None
+            data['tftp_server_address'] = tftp_server_address
+        else:
+            assert tftp_server_address is None
+
+        if server_type == "ST_SFTP":
+            assert sftp_server_address is not None
+            data['sftp_server_address'] = sftp_server_address
+        else:
+            assert sftp_server_address is None
+
         r = self._do_request(requests.post,
                              path,
-                             data={"server_type": "ST_FLASH",
+                             data={"server_type": server_type,
                                    "file_name": file_name,
                                    "is_forced_reboot_enabled": forced_reboot,
                                    "is_recoverymode_enabled": recoverymode})
@@ -262,6 +290,7 @@ class ArubaSwitchApiDriver(NetworkDriver):
                                          port=optional_args.get('port', 80),
                                          username=self.username,
                                          password=self.password)
+        self._load_type = None
 
     def _strip_config(self, config):
         # strip off the non-config parts returned by show run/show config
@@ -335,8 +364,50 @@ class ArubaSwitchApiDriver(NetworkDriver):
 
         return facts
 
-    def cmd(self, commands):
+    def cli(self, commands):
         result = {}
         for command in commands:
             result['command'] = self._api.cli(command)
         return result
+
+    def commit_config(self, message=u'', forced_reboot=False, recoverymode=True):
+        if message:
+            raise NotImplementedError("Commit message not supported on this platform")
+        if self._load_type == 'patch':
+            raise NotImplementedError("not sure what to do with these")
+        elif self._load_type == 'replace':
+            self._api.config_restore(forced_reboot=forced_reboot,
+                                     recoverymode=recoverymode)
+            return
+        raise ValueError("Must call load_(replace|merge)_candidate")
+
+    def load_replace_candidate(self, filename=None, config=None):
+        if filename:
+            with open(filename) as f:
+                config = f.read()
+        if not config:
+            raise ValueError("Must specify config or filename")
+        r = self._api.config_payload(config, "RPT_BACKUP_FILE")
+        self._load_type = 'replace'
+        return r
+
+    def load_merge_candidate(self, filename=None, config=None):
+        raise NotImplementedError("'patch' format not documented, untested")
+        # Not sure what "PATCH_FILE" means... maybe this is something else? :/
+        if filename:
+            with open(filename) as f:
+                config = f.read()
+        if not config:
+            raise ValueError("Must specify config or filename")
+        r = self._api.config_payload(config, "RPT_PATCH_FILE")
+        self._load_type = 'patch'
+        return r
+
+    def discard_config(self):
+        if self._load_type == 'patch':
+            raise NotImplementedError("'patch' format not documented")
+            self._load_type = None
+        elif self._load_type == 'replace':
+            self._api.cli("delete REST_Payload_Backup")
+            self._load_type = None
+        raise ValueError("No config has been loaded to discard")
