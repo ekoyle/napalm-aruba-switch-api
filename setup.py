@@ -20,7 +20,5 @@ setuptools.setup(
         "Operating System :: OS Independent",
     ],
     python_requires="~=3.4",
-    install_requires=[
-        'requests>=2.12.0',
-    ],
+    install_requires=["requests>=2.12.0"],
 )
