@@ -181,7 +181,7 @@ class ArubaSwitchApiClient(object):
     def cli_bulk(self, commands):
         """Note: only config commands?"""
         raise Exception("untested, incomplete implementation")
-        b64_commands = base64.b64encode(commands)
+        b64_commands = base64.b64encode(commands).decode("ascii")
         r = self._do_request(
             requests.post, "cli_bulk", data={"cli_batch_base64_encoded": b64_commands}
         )
@@ -191,7 +191,7 @@ class ArubaSwitchApiClient(object):
     def config_payload(self, config, payload_type):
         assert payload_type in ("RPT_PATCH_FILE", "RPT_BACKUP_FILE")
 
-        config_base64 = base64.b64encode(config.encode("utf-8"))
+        config_base64 = base64.b64encode(config.encode("utf-8")).decode("ascii")
         path = "system/config/payload"
 
         r = self._do_request(
