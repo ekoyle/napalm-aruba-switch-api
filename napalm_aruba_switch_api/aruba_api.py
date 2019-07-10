@@ -1,12 +1,24 @@
 from napalm.base.base import NetworkDriver
+from napalm.base import exceptions as napalm_exceptions
 import requests
 import os
 import base64
 import re
+import difflib
+
+import time
 
 SECONDS_IN_DAY = 86400
 SECONDS_IN_HOUR = 3600
 SECONDS_IN_MINUTE = 60
+
+
+class ApiFailedError(Exception):
+    pass
+
+
+class ApiRetriesExceededError(Exception):
+    pass
 
 
 def parse_snmp(text):
@@ -74,17 +86,27 @@ def parse_sysdescr(sysdescr):
         vendor = "Hewlett Packard (ProCurve)"
         return (vendor, model)
 
-    raise Exception("Failed to parse model from sysDescr")
+    raise ValueError("Failed to parse model from sysDescr")
+
+
+def get_hpe_pseudo_diff(remove, add):
+    diff = list(difflib.unified_diff(remove, add))
+    # ignore control lines
+    return "\n".join(diff[6:])
 
 
 class ArubaSwitchApiClient(object):
-    def __init__(self, transport, hostname, port, username, password):
+    def __init__(
+        self, transport, hostname, port, username, password, timeout=60, ssl_verify=True
+    ):
         self.cookies = {}
         self._headers = {"Accept": "application/json"}
         self.baseurl = None
         self.hostname = hostname
         self.transport = transport
+        self.timeout = timeout
         self.port = port
+        self.ssl_verify = ssl_verify
         self.username = username
         self.password = password
 
@@ -96,12 +118,22 @@ class ArubaSwitchApiClient(object):
         url = os.path.join(self.baseurl, relative_path)
         return url
 
-    def _do_request(self, method, relative_path, data=None, raise_on_error=True):
+    def _do_request(
+        self, method, relative_path, data=None, raise_on_error=True, timeout=None
+    ):
         url = self._get_url(relative_path)
-        args = {"url": url, "cookies": self.cookies, "headers": self._headers}
+        args = {
+            "url": url,
+            "cookies": self.cookies,
+            "headers": self._headers,
+            "verify": self.ssl_verify,
+            "timeout": timeout if timeout is not None else self.timeout,
+        }
         if data:
             args["json"] = data
+
         r = method(**args)
+
         if raise_on_error and not r.ok:
             raise requests.HTTPError(
                 "{} {}: URL: {} data: {}".format(r.status_code, r.reason, r.url, r.text)
@@ -115,7 +147,7 @@ class ArubaSwitchApiClient(object):
 
         # FIXME: find a better function
         r = self._do_request(requests.get, "login-sessions", raise_on_error=False)
-        if not r.ok and "timed out" in r.text:
+        if not r.ok or "timed out" in r.text:
             return False
         return True
 
@@ -128,6 +160,7 @@ class ArubaSwitchApiClient(object):
             requests.post,
             "login-sessions",
             data={"userName": self.username, "password": self.password},
+            timeout=5,
         )
         k, v = r.json()["cookie"].split("=", 1)
         self.cookies[k] = v
@@ -155,7 +188,7 @@ class ArubaSwitchApiClient(object):
                 self.baseurl = os.path.join(self.baseurl, v["version"])
                 break
         else:
-            raise Exception("API v5.0 not supported")
+            raise NotImplementedError("API v5.0 not supported")
 
     def logout(self):
         if not self.baseurl:
@@ -170,7 +203,7 @@ class ArubaSwitchApiClient(object):
         r = self._do_request(requests.post, "cli", data={"cmd": command})
         r = r.json()
         if r["status"] != "CCS_SUCCESS":
-            raise Exception(
+            raise ApiFailedError(
                 "Command failed: {}: {}".format(r["status"], r["error_msg"])
             )
         output = r["result_base64_encoded"]
@@ -180,7 +213,7 @@ class ArubaSwitchApiClient(object):
 
     def cli_bulk(self, commands):
         """Note: only config commands?"""
-        raise Exception("untested, incomplete implementation")
+        raise NotImplementedError("untested, incomplete implementation")
         b64_commands = base64.b64encode(commands).decode("ascii")
         r = self._do_request(
             requests.post, "cli_bulk", data={"cli_batch_base64_encoded": b64_commands}
@@ -206,12 +239,13 @@ class ArubaSwitchApiClient(object):
 
         status = r["status"]
         if status != "CRS_SUCCESS":
-            raise Exception("config payload failed: {}".format(status))
+            raise ApiFailedError(f"config payload failed: {status}: {r}")
 
         return r
 
-    def config_restore(
+    def _config_op(
         self,
+        path=None,
         file_name="REST_Payload_Backup",
         server_type="ST_FLASH",
         tftp_server_address=None,
@@ -219,15 +253,19 @@ class ArubaSwitchApiClient(object):
         forced_reboot=False,
         recoverymode=True,
     ):
-        path = "system/config/cfg_restore"
         assert server_type in ("ST_FLASH", "ST_TFTP", "ST_SFTP")
+
+        if forced_reboot and recoverymode:
+            raise ValueError("recoverymode is not compatible with forced_reboot")
 
         data = {
             "server_type": server_type,
             "file_name": file_name,
             "is_forced_reboot_enabled": forced_reboot,
-            "is_recoverymode_enabled": recoverymode,
         }
+
+        if not forced_reboot:
+            data["is_recoverymode_enabled"] = recoverymode
 
         if server_type == "ST_TFTP":
             assert tftp_server_address is not None
@@ -241,37 +279,36 @@ class ArubaSwitchApiClient(object):
         else:
             assert sftp_server_address is None
 
-        r = self._do_request(
-            requests.post,
-            path,
-            data={
-                "server_type": server_type,
-                "file_name": file_name,
-                "is_forced_reboot_enabled": forced_reboot,
-                "is_recoverymode_enabled": recoverymode,
-            },
-        )
+        r = self._do_request(requests.post, path, data=data)
         r = self._do_check_status(path, r)
         return r
 
-    def config_restore_diff(self):
-        file_name = "REST_Payload_Backup"
+    def config_restore(self, **kwargs):
+        path = "system/config/cfg_restore"
+        return self._config_op(path=path, **kwargs)
+
+    def config_restore_diff(self, **kwargs):
         path = "system/config/cfg_restore/latest_diff"
-        r = self._do_request(
-            requests.post,
-            path,
-            data={"server_type": "ST_FLASH", "file_name": file_name},
-        )
-        r = self._do_check_status(path, r)
-        return r
+        return self._config_op(path=path, **kwargs)
 
     def _do_check_status(self, relative_path, request):
         # for some reason, commands with a /status seem to kill our session
         self._login_if_session_expired()
         if request.json()["status"] != "CRS_IN_PROGRESS":
             return request
+
+        MAX_TRIES = 5
+        WAIT = 5
         poll_path = os.path.join(relative_path, "status")
-        r = self._do_request(requests.get, poll_path)
+        for i in range(MAX_TRIES):
+            if i > 0:
+                time.sleep(WAIT)
+            r = self._do_request(requests.get, poll_path, raise_on_error=False)
+            r_json = r.json()
+            if "status" not in r_json or r_json["status"] != "CRS_IN_PROGRESS":
+                break
+        else:
+            raise ApiRetriesExceededError(r.text)
         return r
 
 
@@ -284,13 +321,15 @@ class ArubaSwitchApiDriver(NetworkDriver):
         self.username = username
         self.password = password
         self.timeout = timeout
-        self.transport = optional_args.get("protocol", "http")
+        self.transport = optional_args.get("transport", "http")
         self._api = ArubaSwitchApiClient(
             transport=self.transport,
             hostname=self.hostname,
-            port=optional_args.get("port", 80),
+            port=optional_args.get("port", 80 if self.transport == "http" else 443),
             username=self.username,
             password=self.password,
+            ssl_verify=optional_args.get("ssl_verify", True),
+            timeout=timeout,
         )
         self._load_type = None
 
@@ -300,7 +339,7 @@ class ArubaSwitchApiDriver(NetworkDriver):
         begin = config.find(";")
         return config[begin:]
 
-    def get_config(self, retrieve=u"all"):
+    def get_config(self, retrieve="all"):
         running = startup = candidate = ""
 
         if retrieve in ["all", "running"]:
@@ -321,7 +360,10 @@ class ArubaSwitchApiDriver(NetworkDriver):
         return {"running": running, "startup": startup, "candidate": candidate}
 
     def open(self):
-        self._api.login()
+        try:
+            self._api.login()
+        except Exception:
+            raise napalm_exceptions.ConnectionException("Failed to connect to device")
 
     def close(self):
         self._api.logout()
@@ -372,16 +414,35 @@ class ArubaSwitchApiDriver(NetworkDriver):
             result["command"] = self._api.cli(command)
         return result
 
-    def commit_config(self, message=u"", forced_reboot=False, recoverymode=True):
+    def compare_config(self):
+        if self._load_type == "patch":
+            raise NotImplementedError("not sure what to do with these")
+        elif self._load_type == "replace":
+            data = self._api.config_restore_diff().json()
+            pseudo_diff = get_hpe_pseudo_diff(
+                remove=data["diff_remove_list"], add=data["diff_add_list"]
+            )
+
+            return pseudo_diff
+        raise ValueError("Must call load_(replace|merge)_candidate")
+
+    def commit_config(self, message="", forced_reboot=False, recoverymode=True):
         if message:
             raise NotImplementedError("Commit message not supported on this platform")
         if self._load_type == "patch":
             raise NotImplementedError("not sure what to do with these")
         elif self._load_type == "replace":
-            self._api.config_restore(
+            result = self._api.config_restore(
                 forced_reboot=forced_reboot, recoverymode=recoverymode
             )
-            return
+
+            result_data = result.json()
+            if result_data["status"] != "CRS_SUCCESS":
+                status = result_data["status"]
+                failure_reason = result_data.get("failure_reason", "")
+                raise ApiFailedError(f"{status}: {failure_reason}: {result.text}")
+            return result
+
         raise ValueError("Must call load_(replace|merge)_candidate")
 
     def load_replace_candidate(self, filename=None, config=None):
@@ -410,7 +471,9 @@ class ArubaSwitchApiDriver(NetworkDriver):
         if self._load_type == "patch":
             raise NotImplementedError("'patch' format not documented")
             self._load_type = None
+            return
         elif self._load_type == "replace":
             self._api.cli("delete REST_Payload_Backup")
             self._load_type = None
+            return
         raise ValueError("No config has been loaded to discard")

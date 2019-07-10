@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="napalm-aruba-switch-api",
-    version="0.0.1",
+    version="0.0.2",
     author="Eldon Koyle",
     author_email="ekoyle@gmail.com",
     description="NAPALM driver for HPE/Aruba switches using rest-api",
